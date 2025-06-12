@@ -136,6 +136,7 @@ def deseasonalize(vol, freq):
     else:
         cat = vol.index.month
     dummies = pd.get_dummies(cat)
+    dummies.index = vol.index  # align for arithmetic
     beta = np.linalg.lstsq(dummies, vol.fillna(0), rcond=None)[0]
     seasonal = dummies.dot(beta)
     return vol - seasonal
