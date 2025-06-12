@@ -1,6 +1,7 @@
 import zipfile
 from pathlib import Path
 import io
+import csv
 
 import pandas as pd
 import numpy as np
@@ -44,25 +45,37 @@ def load_and_melt(csv_path):
 
 
 def load_zip_long(zip_path):
-    """Return long-format DataFrame from all CSVs within a zip."""
+    """Return long-format DataFrame and metadata from all CSVs within a zip."""
     frames = []
+    meta_records = []
     with zipfile.ZipFile(zip_path) as z:
         for name in z.namelist():
             if not name.lower().endswith('.csv'):
                 continue
             with z.open(name) as f:
                 lines = f.read().decode('utf-8').splitlines()
+
+            meta = {}
+            if len(lines) >= 2 and 'Series Type' in lines[0]:
+                try:
+                    reader = csv.DictReader(lines[:2])
+                    meta = next(reader)
+                except Exception:
+                    meta = {}
+
             header = 0
             for i, line in enumerate(lines):
                 if line.lower().startswith('date'):
                     header = i
                     break
+
             data_lines = []
             for line in lines[header:]:
                 low = line.lower()
                 if low.startswith('id,') or low.startswith('quota'):
                     break
                 data_lines.append(line)
+
             if not data_lines:
                 continue
             df = pd.read_csv(io.StringIO('\n'.join(data_lines)))
@@ -72,9 +85,17 @@ def load_zip_long(zip_path):
             long = df.melt(id_vars='Date', var_name='Ticker_Field', value_name='Value')
             long[['Ticker', 'Field']] = long['Ticker_Field'].str.split('_', n=1, expand=True)
             frames.append(long[['Date', 'Ticker', 'Field', 'Value']])
+
+            if meta:
+                meta_records.append({'Ticker': meta.get('Ticker', ''),
+                                     'Series Type': meta.get('Series Type', '').strip()})
+
     if not frames:
-        return pd.DataFrame(columns=['Date', 'Ticker', 'Field', 'Value'])
-    return pd.concat(frames, ignore_index=True)
+        return pd.DataFrame(columns=['Date', 'Ticker', 'Field', 'Value']), pd.DataFrame()
+
+    df_long = pd.concat(frames, ignore_index=True)
+    meta_df = pd.DataFrame(meta_records).drop_duplicates('Ticker')
+    return df_long, meta_df
 
 # 2. Select Price Series
 
@@ -227,6 +248,87 @@ def cluster_assets(cycle_map, n_clusters=3):
     labels = model.fit_predict(periods)
     return pd.Series(labels, index=tickers)
 
+def wavelet_coherence(series_a, series_b, wavelet="morl", scales=None):
+    """Compute average wavelet coherence between two series."""
+    s1 = series_a.dropna()
+    s2 = series_b.dropna()
+    common = s1.index.intersection(s2.index)
+    if common.empty:
+        return np.array([])
+    a = s1.loc[common].values
+    b = s2.loc[common].values
+    if scales is None:
+        N = len(common)
+        scales = np.arange(1, min(128, N // 2))
+    c1, _ = pywt.cwt(a, scales, wavelet)
+    c2, _ = pywt.cwt(b, scales, wavelet)
+    S1 = np.abs(c1) ** 2
+    S2 = np.abs(c2) ** 2
+    X = c1 * np.conj(c2)
+    S12 = np.abs(X) ** 2
+    def smooth(mat):
+        kernel = np.ones(3) / 3.0
+        return np.apply_along_axis(lambda m: np.convolve(m, kernel, mode="same"), 1, mat)
+    WCOH = smooth(S12) / (smooth(S1) * smooth(S2))
+    return WCOH.mean(axis=1)
+
+def wavelet_coherence_matrix(vol_dict):
+    """Return matrix of average wavelet coherence between pairs."""
+    tickers = list(vol_dict.keys())
+    mat = pd.DataFrame(index=tickers, columns=tickers, dtype=float)
+    for i, t1 in enumerate(tickers):
+        mat.loc[t1, t1] = 1.0
+        for t2 in tickers[i + 1:]:
+            coh = wavelet_coherence(vol_dict[t1], vol_dict[t2])
+            avg = float(np.nanmean(coh)) if len(coh) else np.nan
+            mat.loc[t1, t2] = avg
+            mat.loc[t2, t1] = avg
+    return mat
+
+def build_group_map(meta_df):
+    groups = {}
+    for _, row in meta_df.iterrows():
+        grp = row.get("Series Type", "Unknown") or "Unknown"
+        groups.setdefault(grp, []).append(row["Ticker"])
+    return groups
+
+def group_start_dates(close_df, groups):
+    individual = detect_daily_start(close_df)
+    result = {}
+    for g, ticks in groups.items():
+        starts = [individual.get(t) for t in ticks if t in individual]
+        if not starts:
+            continue
+        group_start = max(starts)
+        for t in ticks:
+            result[t] = group_start
+    return result
+
+def analyze_group(name, tickers, tf_returns):
+    daily_vol = {t: realized_vol(tf_returns[t]["D"], 10) for t in tickers if t in tf_returns}
+    if len(daily_vol) < 2:
+        return
+    corr_df = rolling_correlations(daily_vol)
+    corr_df.to_csv(f"{name}_rolling_correlations.csv")
+
+    price_df = {t: tf_returns[t]["D"].cumsum() for t in tickers if t in tf_returns}
+    close_wide = pd.DataFrame(price_df)
+    coin_mat = cointegration_matrix(close_wide)
+    coin_mat.to_csv(f"{name}_cointegration_pvalues.csv")
+
+    df = pd.DataFrame(daily_vol).dropna()
+    if df.shape[0] > 1 and df.shape[1] > 1:
+        n_comp = min(3, df.shape[0], df.shape[1])
+        pca, comps = pca_volatility(daily_vol, n_components=n_comp)
+        comps.to_csv(f"{name}_volatility_pca.csv")
+
+    coh = coherence_matrix(daily_vol)
+    coh.to_csv(f"{name}_coherence_matrix.csv")
+
+    wcoh = wavelet_coherence_matrix(daily_vol)
+    wcoh.to_csv(f"{name}_wavelet_coherence.csv")
+
+
 # Visualization and summary helpers
 
 def save_cycle_summary(cycle_map, path="cycle_summary.csv"):
@@ -277,10 +379,11 @@ def plot_cluster_bars(labels, path="cluster_assignments.png"):
 if __name__ == '__main__':
     if not Path('mainz.zip').exists():
         raise FileNotFoundError('mainz.zip not found')
-    df_long = load_zip_long('mainz.zip')
+
+    df_long, meta_df = load_zip_long('mainz.zip')
     close_df = select_close(df_long)
-    close_df = restrict_window(close_df)
-    start_map = detect_daily_start(close_df)
+    group_map = build_group_map(meta_df)
+    start_map = group_start_dates(close_df, group_map)
     tf_returns = make_timeframes(close_df, start_map)
 
     results = {}
@@ -296,7 +399,11 @@ if __name__ == '__main__':
             else:
                 print(f'{ticker} {freq} cycle period: {T:.2f}')
 
-    # Cross-asset analyses using daily volatility
+    # Cross-asset analyses within each series type
+    for grp, tickers in group_map.items():
+        analyze_group(grp.replace(' ', '_'), tickers, tf_returns)
+
+    # Overall cross-asset analysis
     daily_vol = {t: realized_vol(r['D'], 10) for t, r in tf_returns.items()}
     corr_df = rolling_correlations(daily_vol)
     corr_df.to_csv('rolling_correlations.csv')
