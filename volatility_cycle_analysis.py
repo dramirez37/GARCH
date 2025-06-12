@@ -1,15 +1,19 @@
 import zipfile
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from statsmodels.tsa.stattools import acf
+from statsmodels.tsa.stattools import acf, coint
 from statsmodels.tsa.statespace.markov_regression import MarkovRegression
 from arch import arch_model
 from scipy.fft import rfft, rfftfreq
+from scipy.signal import coherence
+from sklearn.decomposition import PCA
+from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import roc_curve, auc
 import pywt
-from pathlib import Path
 
 # 1. Load & Reshape
 
@@ -111,7 +115,51 @@ def detect_cycle(vol):
     period = 1/xf[idx]
     return period
 
-# Placeholder for more complex analysis functions ...
+
+# Additional Analysis Functions
+
+def rolling_correlations(vol_dict, window=252):
+    """Return a DataFrame of rolling correlations for each pair of tickers."""
+    df = pd.DataFrame(vol_dict)
+    return df.rolling(window).corr().dropna()
+
+
+def cointegration_matrix(price_df):
+    """Compute p-values of cointegration tests between all pairs."""
+    tickers = price_df.columns
+    pvals = pd.DataFrame(index=tickers, columns=tickers, dtype=float)
+    for i, t1 in enumerate(tickers):
+        for t2 in tickers[i+1:]:
+            _, p, _ = coint(price_df[t1].dropna(), price_df[t2].dropna())
+            pvals.loc[t1, t2] = p
+            pvals.loc[t2, t1] = p
+    return pvals
+
+
+def cross_spectral_density(series_a, series_b):
+    """Return frequencies and coherence between two volatility series."""
+    s1 = series_a.dropna()
+    s2 = series_b.dropna()
+    common = s1.index.intersection(s2.index)
+    f, coh = coherence(s1.loc[common], s2.loc[common], fs=1)
+    return f, coh
+
+
+def pca_volatility(vol_dict, n_components=3):
+    """Perform PCA on the aligned volatility series."""
+    df = pd.DataFrame(vol_dict).dropna()
+    pca = PCA(n_components=n_components)
+    comps = pca.fit_transform(df)
+    return pca, pd.DataFrame(comps, index=df.index)
+
+
+def cluster_assets(cycle_map, n_clusters=3):
+    """Cluster tickers based on detected cycle periods."""
+    tickers = list(cycle_map.keys())
+    periods = np.array([list(cycle_map[t].values()) for t in tickers])
+    model = AgglomerativeClustering(n_clusters=n_clusters)
+    labels = model.fit_predict(periods)
+    return pd.Series(labels, index=tickers)
 
 if __name__ == '__main__':
     csv_name = 'David_Ramirez_Mainv2_20250612134107.csv'
@@ -135,5 +183,20 @@ if __name__ == '__main__':
             T = detect_cycle(vol)
             results[ticker][freq] = T
             print(f'{ticker} {freq} cycle period: {T:.2f}')
+
+    # Cross-asset analyses using daily volatility
+    daily_vol = {t: realized_vol(r['D'], 10) for t, r in tf_returns.items()}
+    corr_df = rolling_correlations(daily_vol)
+    corr_df.to_csv('rolling_correlations.csv')
+
+    close_wide = close_df.pivot(index='Date', columns='Ticker', values='Value')
+    coint_pvals = cointegration_matrix(close_wide)
+    coint_pvals.to_csv('cointegration_pvalues.csv')
+
+    pca, pca_series = pca_volatility(daily_vol)
+    pca_series.to_csv('volatility_pca.csv')
+
+    cluster_labels = cluster_assets(results)
+    cluster_labels.to_csv('cycle_clusters.csv')
 
     # Further modelling and reporting would be implemented here
