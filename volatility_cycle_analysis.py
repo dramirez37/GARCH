@@ -1,12 +1,12 @@
 import zipfile
 from pathlib import Path
+import io
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from statsmodels.tsa.stattools import acf, coint
-from statsmodels.tsa.statespace.markov_regression import MarkovRegression
 from arch import arch_model
 from scipy.fft import rfft, rfftfreq
 from scipy.signal import coherence
@@ -14,6 +14,8 @@ from sklearn.decomposition import PCA
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import roc_curve, auc
 import pywt
+
+plt.style.use("seaborn-v0_8")
 
 # 1. Load & Reshape
 
@@ -29,15 +31,50 @@ def find_header_row(csv_path):
 def load_and_melt(csv_path):
     header_row = find_header_row(csv_path)
     df = pd.read_csv(csv_path, skiprows=header_row, header=0)
-    df['Date'] = pd.to_datetime(df['Date'])
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    df = df.dropna(subset=['Date'])
     df = df.set_index('Date')
     df.columns = df.columns.str.strip()
     long_df = (
         df.reset_index()
         .melt(id_vars='Date', var_name='Ticker_Field', value_name='Value')
     )
-    long_df[['Ticker', 'Field']] = long_df['Ticker_Field'].str.split('_', 1, expand=True)
+    long_df[['Ticker', 'Field']] = long_df['Ticker_Field'].str.split('_', n=1, expand=True)
     return long_df[['Date', 'Ticker', 'Field', 'Value']]
+
+
+def load_zip_long(zip_path):
+    """Return long-format DataFrame from all CSVs within a zip."""
+    frames = []
+    with zipfile.ZipFile(zip_path) as z:
+        for name in z.namelist():
+            if not name.lower().endswith('.csv'):
+                continue
+            with z.open(name) as f:
+                lines = f.read().decode('utf-8').splitlines()
+            header = 0
+            for i, line in enumerate(lines):
+                if line.lower().startswith('date'):
+                    header = i
+                    break
+            data_lines = []
+            for line in lines[header:]:
+                low = line.lower()
+                if low.startswith('id,') or low.startswith('quota'):
+                    break
+                data_lines.append(line)
+            if not data_lines:
+                continue
+            df = pd.read_csv(io.StringIO('\n'.join(data_lines)))
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            df = df.dropna(subset=['Date'])
+            df.columns = df.columns.str.strip()
+            long = df.melt(id_vars='Date', var_name='Ticker_Field', value_name='Value')
+            long[['Ticker', 'Field']] = long['Ticker_Field'].str.split('_', n=1, expand=True)
+            frames.append(long[['Date', 'Ticker', 'Field', 'Value']])
+    if not frames:
+        return pd.DataFrame(columns=['Date', 'Ticker', 'Field', 'Value'])
+    return pd.concat(frames, ignore_index=True)
 
 # 2. Select Price Series
 
@@ -107,12 +144,14 @@ def deseasonalize(vol, freq):
 
 def detect_cycle(vol):
     vol = vol.dropna()
+    if len(vol) < 4:
+        return np.nan
     N = len(vol)
     yf = rfft(vol - vol.mean())
     xf = rfftfreq(N, 1)
-    power = np.abs(yf)**2
-    idx = power[1:].argmax()+1
-    period = 1/xf[idx]
+    power = np.abs(yf) ** 2
+    idx = power[1:].argmax() + 1
+    period = 1 / xf[idx]
     return period
 
 
@@ -130,7 +169,10 @@ def cointegration_matrix(price_df):
     pvals = pd.DataFrame(index=tickers, columns=tickers, dtype=float)
     for i, t1 in enumerate(tickers):
         for t2 in tickers[i+1:]:
-            _, p, _ = coint(price_df[t1].dropna(), price_df[t2].dropna())
+            try:
+                _, p, _ = coint(price_df[t1].dropna(), price_df[t2].dropna())
+            except Exception:
+                p = np.nan
             pvals.loc[t1, t2] = p
             pvals.loc[t2, t1] = p
     return pvals
@@ -145,6 +187,20 @@ def cross_spectral_density(series_a, series_b):
     return f, coh
 
 
+def coherence_matrix(vol_dict):
+    """Return matrix of average coherence between each pair of tickers."""
+    tickers = list(vol_dict.keys())
+    mat = pd.DataFrame(index=tickers, columns=tickers, dtype=float)
+    for i, t1 in enumerate(tickers):
+        mat.loc[t1, t1] = 1.0
+        for t2 in tickers[i + 1:]:
+            _, coh = cross_spectral_density(vol_dict[t1], vol_dict[t2])
+            avg = float(np.nanmean(coh)) if len(coh) else np.nan
+            mat.loc[t1, t2] = avg
+            mat.loc[t2, t1] = avg
+    return mat
+
+
 def pca_volatility(vol_dict, n_components=3):
     """Perform PCA on the aligned volatility series."""
     df = pd.DataFrame(vol_dict).dropna()
@@ -155,20 +211,72 @@ def pca_volatility(vol_dict, n_components=3):
 
 def cluster_assets(cycle_map, n_clusters=3):
     """Cluster tickers based on detected cycle periods."""
-    tickers = list(cycle_map.keys())
-    periods = np.array([list(cycle_map[t].values()) for t in tickers])
+    tickers = []
+    rows = []
+    for t, d in cycle_map.items():
+        vals = list(d.values())
+        if any(np.isnan(vals)):
+            continue
+        tickers.append(t)
+        rows.append(vals)
+    if not rows:
+        return pd.Series(dtype=int)
+    periods = np.array(rows)
     model = AgglomerativeClustering(n_clusters=n_clusters)
     labels = model.fit_predict(periods)
     return pd.Series(labels, index=tickers)
 
+# Visualization and summary helpers
+
+def save_cycle_summary(cycle_map, path="cycle_summary.csv"):
+    """Save detected cycle periods for each ticker/frequency."""
+    df = (
+        pd.DataFrame(cycle_map)
+        .T
+        .rename_axis("Ticker")
+    )
+    df.to_csv(path)
+    return df
+
+
+def plot_heatmap(data, title, path):
+    """Save heatmap of a DataFrame to disk."""
+    if data.empty:
+        return
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(data, annot=False, cmap="viridis")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def plot_pca_variance(pca, path="pca_scree.png"):
+    """Plot cumulative explained variance from a PCA object."""
+    cumvar = np.cumsum(pca.explained_variance_ratio_)
+    plt.figure()
+    plt.plot(range(1, len(cumvar) + 1), cumvar, marker="o")
+    plt.xlabel("Component")
+    plt.ylabel("Cumulative Explained Variance")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def plot_cluster_bars(labels, path="cluster_assignments.png"):
+    """Bar plot of cluster assignments for each ticker."""
+    plt.figure(figsize=(8, 4))
+    labels.sort_index().plot(kind="bar")
+    plt.ylabel("Cluster")
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
 if __name__ == '__main__':
-    csv_name = 'David_Ramirez_Mainv2_20250612134107.csv'
-    if not Path(csv_name).exists():
-        with zipfile.ZipFile('mainz.zip') as z:
-            target = [n for n in z.namelist() if n.endswith('.csv')][0]
-            with z.open(target) as f:
-                Path(csv_name).write_bytes(f.read())
-    df_long = load_and_melt(csv_name)
+    if not Path('mainz.zip').exists():
+        raise FileNotFoundError('mainz.zip not found')
+    df_long = load_zip_long('mainz.zip')
     close_df = select_close(df_long)
     close_df = restrict_window(close_df)
     start_map = detect_daily_start(close_df)
@@ -182,7 +290,10 @@ if __name__ == '__main__':
             vol = deseasonalize(vol, freq)
             T = detect_cycle(vol)
             results[ticker][freq] = T
-            print(f'{ticker} {freq} cycle period: {T:.2f}')
+            if np.isnan(T):
+                print(f'{ticker} {freq} cycle period: NA')
+            else:
+                print(f'{ticker} {freq} cycle period: {T:.2f}')
 
     # Cross-asset analyses using daily volatility
     daily_vol = {t: realized_vol(r['D'], 10) for t, r in tf_returns.items()}
@@ -196,7 +307,18 @@ if __name__ == '__main__':
     pca, pca_series = pca_volatility(daily_vol)
     pca_series.to_csv('volatility_pca.csv')
 
+    coh_mat = coherence_matrix(daily_vol)
+    coh_mat.to_csv('coherence_matrix.csv')
+
     cluster_labels = cluster_assets(results)
     cluster_labels.to_csv('cycle_clusters.csv')
+
+    # Generate figures and summary files
+    save_cycle_summary(results)
+    plot_heatmap(corr_df.groupby(level=0).last(), "Rolling Correlations", "correlation_heatmap.png")
+    plot_heatmap(coint_pvals, "Cointegration p-values", "cointegration_heatmap.png")
+    plot_heatmap(coh_mat, "Spectral Coherence", "coherence_heatmap.png")
+    plot_pca_variance(pca)
+    plot_cluster_bars(cluster_labels)
 
     # Further modelling and reporting would be implemented here
