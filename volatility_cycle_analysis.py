@@ -1,12 +1,12 @@
 import zipfile
 from pathlib import Path
+import io
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from statsmodels.tsa.stattools import acf, coint
-from statsmodels.tsa.statespace.markov_regression import MarkovRegression
 from arch import arch_model
 from scipy.fft import rfft, rfftfreq
 from scipy.signal import coherence
@@ -14,6 +14,8 @@ from sklearn.decomposition import PCA
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import roc_curve, auc
 import pywt
+
+plt.style.use("seaborn-v0_8")
 
 # 1. Load & Reshape
 
@@ -29,15 +31,48 @@ def find_header_row(csv_path):
 def load_and_melt(csv_path):
     header_row = find_header_row(csv_path)
     df = pd.read_csv(csv_path, skiprows=header_row, header=0)
-    df['Date'] = pd.to_datetime(df['Date'])
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    df = df.dropna(subset=['Date'])
     df = df.set_index('Date')
     df.columns = df.columns.str.strip()
     long_df = (
         df.reset_index()
         .melt(id_vars='Date', var_name='Ticker_Field', value_name='Value')
     )
-    long_df[['Ticker', 'Field']] = long_df['Ticker_Field'].str.split('_', 1, expand=True)
+    long_df[['Ticker', 'Field']] = long_df['Ticker_Field'].str.split('_', n=1, expand=True)
     return long_df[['Date', 'Ticker', 'Field', 'Value']]
+
+
+def load_zip_long(zip_path):
+    """Return long-format DataFrame from all CSVs within a zip."""
+    frames = []
+    with zipfile.ZipFile(zip_path) as z:
+        for name in z.namelist():
+            if not name.endswith('.csv'):
+                continue
+            with z.open(name) as f:
+                lines = f.read().decode('utf-8').splitlines()
+            header = 0
+            for i, line in enumerate(lines):
+                if line.lower().startswith('date'):
+                    header = i
+                    break
+            data_lines = []
+            for line in lines[header:]:
+                low = line.lower()
+                if low.startswith('id,') or low.startswith('quota'):
+                    break
+                data_lines.append(line)
+            df = pd.read_csv(io.StringIO('\n'.join(data_lines)))
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            df = df.dropna(subset=['Date'])
+            df.columns = df.columns.str.strip()
+            long = (
+                df.melt(id_vars='Date', var_name='Ticker_Field', value_name='Value')
+            )
+            long[['Ticker', 'Field']] = long['Ticker_Field'].str.split('_', n=1, expand=True)
+            frames.append(long[['Date', 'Ticker', 'Field', 'Value']])
+    return pd.concat(frames, ignore_index=True)
 
 # 2. Select Price Series
 
@@ -161,14 +196,55 @@ def cluster_assets(cycle_map, n_clusters=3):
     labels = model.fit_predict(periods)
     return pd.Series(labels, index=tickers)
 
+# Visualization and summary helpers
+
+def save_cycle_summary(cycle_map, path="cycle_summary.csv"):
+    """Save detected cycle periods for each ticker/frequency."""
+    df = (
+        pd.DataFrame(cycle_map)
+        .T
+        .rename_axis("Ticker")
+    )
+    df.to_csv(path)
+    return df
+
+
+def plot_heatmap(data, title, path):
+    """Save heatmap of a DataFrame to disk."""
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(data, annot=False, cmap="viridis")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def plot_pca_variance(pca, path="pca_scree.png"):
+    """Plot cumulative explained variance from a PCA object."""
+    cumvar = np.cumsum(pca.explained_variance_ratio_)
+    plt.figure()
+    plt.plot(range(1, len(cumvar) + 1), cumvar, marker="o")
+    plt.xlabel("Component")
+    plt.ylabel("Cumulative Explained Variance")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def plot_cluster_bars(labels, path="cluster_assignments.png"):
+    """Bar plot of cluster assignments for each ticker."""
+    plt.figure(figsize=(8, 4))
+    labels.sort_index().plot(kind="bar")
+    plt.ylabel("Cluster")
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
 if __name__ == '__main__':
-    csv_name = 'David_Ramirez_Mainv2_20250612134107.csv'
-    if not Path(csv_name).exists():
-        with zipfile.ZipFile('mainz.zip') as z:
-            target = [n for n in z.namelist() if n.endswith('.csv')][0]
-            with z.open(target) as f:
-                Path(csv_name).write_bytes(f.read())
-    df_long = load_and_melt(csv_name)
+    if not Path('mainz.zip').exists():
+        raise FileNotFoundError('mainz.zip not found')
+    df_long = load_zip_long('mainz.zip')
     close_df = select_close(df_long)
     close_df = restrict_window(close_df)
     start_map = detect_daily_start(close_df)
@@ -198,5 +274,12 @@ if __name__ == '__main__':
 
     cluster_labels = cluster_assets(results)
     cluster_labels.to_csv('cycle_clusters.csv')
+
+    # Generate figures and summary files
+    save_cycle_summary(results)
+    plot_heatmap(corr_df.groupby(level=0).last(), "Rolling Correlations", "correlation_heatmap.png")
+    plot_heatmap(coint_pvals, "Cointegration p-values", "cointegration_heatmap.png")
+    plot_pca_variance(pca)
+    plot_cluster_bars(cluster_labels)
 
     # Further modelling and reporting would be implemented here
