@@ -21,5 +21,9 @@ data begins on row 4. The script automatically detects this layout.
 
 Running the script writes summary tables and figures to the working directory,
 including rolling correlation, cointegration and coherence heatmaps, PCA scree
-plots and cluster assignments.
+plots and cluster assignments. Tickers are automatically grouped by the
+"Series Type" metadata so that cross-asset analyses are performed both across
+all tickers and within each asset group. When assets in a group have different
+data ranges, the analysis starts at the first date shared by every member of
+that group.
 
