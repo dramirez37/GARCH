@@ -1,4 +1,5 @@
 import io
+import csv
 import zipfile
 from pathlib import Path
 
@@ -9,13 +10,34 @@ import seaborn as sns
 from hmmlearn.hmm import GaussianHMM
 from scipy.signal import hilbert
 from statsmodels.discrete.discrete_model import Logit
+from ms_garch_full import load_yield_spread
 
 plt.style.use("seaborn-v0_8")
 
 
-def load_real_close(zip_path: str) -> pd.DataFrame:
-    """Load real (inflation-adjusted) close prices from a zip archive."""
+def load_real_close(zip_path: str):
+    """Load real closes and ticker countries from a zip archive."""
     frames = []
+    countries = {}
+
+    def iso3(name: str) -> str:
+        mapping = {
+            "United States": "USA",
+            "United Kingdom": "GBR",
+            "Germany": "DEU",
+            "France": "FRA",
+            "Japan": "JPN",
+            "Korea, Republic of": "KOR",
+            "India": "IND",
+            "Brazil": "BRA",
+            "Australia": "AUS",
+            "Mexico": "MEX",
+            "Russian Federation": "RUS",
+            "China": "CHN",
+            "Spain": "ESP",
+        }
+        return mapping.get(name.strip(), name[:3].upper())
+
     with zipfile.ZipFile(zip_path) as z:
         for name in z.namelist():
             if not name.lower().endswith(".csv"):
@@ -27,23 +49,26 @@ def load_real_close(zip_path: str) -> pd.DataFrame:
                 if line.lower().startswith("date"):
                     header = i
                     break
-            df = pd.read_csv(
-                io.StringIO("\n".join(lines[header:])),
-                engine="python",
-                on_bad_lines="skip",
-            )
+            if header == 0:
+                continue
+            meta = list(csv.reader([lines[header - 1]]))[0]
+            country = iso3(meta[4]) if len(meta) > 4 else None
+            df = pd.read_csv(io.StringIO("\n".join(lines[header:])), engine="python", on_bad_lines="skip")
             real_cols = [c for c in df.columns if c.lower().endswith("real_close")]
             if not real_cols:
                 continue
             df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
             df[real_cols[0]] = pd.to_numeric(df[real_cols[0]], errors="coerce")
-            df = df.dropna(subset=["Date"])
-            df = df.set_index("Date")
+            df = df.dropna(subset=["Date"]).set_index("Date")
             ticker = name.split(".")[0]
             frames.append(df[[real_cols[0]]].rename(columns={real_cols[0]: ticker}))
+            if country:
+                countries[ticker] = country
+
     if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, axis=1).sort_index()
+        return pd.DataFrame(), {}
+
+    return pd.concat(frames, axis=1).sort_index(), countries
 
 
 def realized_vol(series: pd.Series, window: int = 20) -> pd.Series:
@@ -68,15 +93,15 @@ def compute_cycle_phase(series: pd.Series) -> pd.Series:
     return pd.Series(phase, index=series.index)
 
 
-def logistic_transition(series, states, squeeze, phase):
+def logistic_transition(spread, phase, states):
     """Estimate logistic regression for P(s_{t+1}=H | s_t=L)."""
-    s = pd.Series(states, index=series.index)
+    s = pd.Series(states, index=spread.index)
     target = ((s.shift(-1) == 1) & (s == 0)).astype(int)
-    df = pd.DataFrame({"target": target, "squeeze": squeeze, "phase": np.cos(phase)})
+    df = pd.DataFrame({"target": target, "spread": spread, "phase": np.cos(phase)})
     df = df.dropna()
     if df.empty:
         return None
-    model = Logit(df["target"], df[["squeeze", "phase"]]).fit(disp=False)
+    model = Logit(df["target"], df[["spread", "phase"]]).fit(disp=False)
     return model
 
 
@@ -160,7 +185,8 @@ def plot_hazard_survival(durations, state_name, path_prefix):
 def main(zip_path="mainz.zip"):
     if not Path(zip_path).exists():
         raise FileNotFoundError(zip_path)
-    prices = load_real_close(zip_path)
+    prices, meta = load_real_close(zip_path)
+    spreads = load_yield_spread(zip_path)
     if prices.empty:
         raise ValueError("No real-close columns found")
     for ticker in prices.columns:
@@ -169,7 +195,11 @@ def main(zip_path="mainz.zip"):
         states, prob, model = fit_hmm(returns)
         vol = realized_vol(returns)
         phase = compute_cycle_phase(vol)
-        transition = logistic_transition(returns, states, vol, phase)
+        transition = None
+        country = meta.get(ticker)
+        if country and not spreads.empty and country in spreads.columns:
+            sp = spreads[country].reindex(returns.index, method="ffill")
+            transition = logistic_transition(sp, phase, states)
         plot_price_with_regime(series.loc[returns.index], states, f"{ticker}_price_regime.png")
         plot_regime_prob(prob, returns.index, f"{ticker}_regime_prob.png")
         dur_low = regime_durations(states, 0)
@@ -178,15 +208,18 @@ def main(zip_path="mainz.zip"):
         plot_hazard_survival(dur_low, "Low", f"{ticker}_low")
         plot_hazard_survival(dur_high, "High", f"{ticker}_high")
         if transition is not None:
-            grid_x = np.linspace(np.nanmin(vol), np.nanmax(vol), 50)
+            sp = spreads[country].reindex(returns.index, method="ffill") if country in spreads.columns else None
+            if sp is None or sp.isna().all():
+                continue
+            grid_x = np.linspace(np.nanmin(sp), np.nanmax(sp), 50)
             grid_y = np.linspace(-1, 1, 50)
             X, Y = np.meshgrid(grid_x, grid_y)
-            logits = transition.params[0]*X + transition.params[1]*Y + transition.params.get('const',0)
+            logits = transition.params["spread"] * X + transition.params["phase"] * Y + transition.params.get("const", 0)
             Z = 1/(1+np.exp(-logits))
             plt.figure(figsize=(6,4))
             cs = plt.contourf(X, Y, Z, levels=20, cmap="viridis")
             plt.colorbar(cs)
-            plt.xlabel("Squeeze")
+            plt.xlabel("Spread")
             plt.ylabel("cos(Phase)")
             plt.title("Transition Probability")
             plt.tight_layout()

@@ -15,9 +15,41 @@ from sklearn.metrics import roc_curve, auc
 plt.style.use("seaborn-v0_8")
 
 
-def load_price_series(zip_path: str, real=True):
-    """Return DataFrame of real or nominal closes indexed by Date."""
+def load_price_series(zip_path: str, real: bool = True, return_meta: bool = False):
+    """Return DataFrame of closes and optional ticker metadata.
+
+    Parameters
+    ----------
+    zip_path : str
+        Path to archive with CSV files.
+    real : bool, optional
+        If True, load inflation-adjusted closes; otherwise nominal closes.
+    return_meta : bool, optional
+        If True, also return a mapping of ``ticker -> country_code`` parsed from
+        the metadata rows.
+    """
+
     frames = []
+    countries = {}
+
+    def iso3(name: str) -> str:
+        mapping = {
+            "United States": "USA",
+            "United Kingdom": "GBR",
+            "Germany": "DEU",
+            "France": "FRA",
+            "Japan": "JPN",
+            "Korea, Republic of": "KOR",
+            "India": "IND",
+            "Brazil": "BRA",
+            "Australia": "AUS",
+            "Mexico": "MEX",
+            "Russian Federation": "RUS",
+            "China": "CHN",
+            "Spain": "ESP",
+        }
+        return mapping.get(name.strip(), name[:3].upper())
+
     with zipfile.ZipFile(zip_path) as z:
         for name in z.namelist():
             if not name.lower().endswith(".csv"):
@@ -29,10 +61,13 @@ def load_price_series(zip_path: str, real=True):
                 if line.lower().startswith("date"):
                     header = i
                     break
+            if header == 0:
+                continue
+            meta = list(csv.reader([lines[header - 1]]))[0]
+            country = iso3(meta[4]) if len(meta) > 4 else None
             df = pd.read_csv(io.StringIO("\n".join(lines[header:])), engine="python", on_bad_lines="skip")
             df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df = df.dropna(subset=["Date"])
-            df = df.set_index("Date")
+            df = df.dropna(subset=["Date"]).set_index("Date")
             cols = [c for c in df.columns if c.lower().endswith("real_close")]
             if not real:
                 tmp = [c for c in df.columns if c.lower().endswith("close") and not c.lower().endswith("real_close")]
@@ -42,9 +77,18 @@ def load_price_series(zip_path: str, real=True):
             ticker = name.split(".")[0]
             series = pd.to_numeric(df[cols[0]], errors="coerce")
             frames.append(series.rename(ticker))
+            if country:
+                countries[ticker] = country
+
     if not frames:
+        if return_meta:
+            return pd.DataFrame(), {}
         return pd.DataFrame()
-    return pd.concat(frames, axis=1).sort_index()
+
+    result = pd.concat(frames, axis=1).sort_index()
+    if return_meta:
+        return result, countries
+    return result
 
 
 def load_yield_spread(zip_path: str):
@@ -57,6 +101,24 @@ def load_yield_spread(zip_path: str):
     ten = {}
     three = {}
     direct = {}
+
+    def iso3(name: str) -> str:
+        mapping = {
+            "United States": "USA",
+            "United Kingdom": "GBR",
+            "Germany": "DEU",
+            "France": "FRA",
+            "Japan": "JPN",
+            "Korea, Republic of": "KOR",
+            "India": "IND",
+            "Brazil": "BRA",
+            "Australia": "AUS",
+            "Mexico": "MEX",
+            "Russian Federation": "RUS",
+            "China": "CHN",
+            "Spain": "ESP",
+        }
+        return mapping.get(name.strip(), name[:3].upper())
     with zipfile.ZipFile(zip_path) as z:
         for name in z.namelist():
             if not name.lower().endswith(".csv"):
@@ -85,14 +147,18 @@ def load_yield_spread(zip_path: str):
                 df = df.dropna(subset=["Date"]).set_index("Date")
                 three[country] = pd.to_numeric(df[df.columns[1]], errors="coerce")
             if "10Y3M" in code.upper():
-                df = pd.read_csv(
-                    io.StringIO(z.read(name).decode("utf-8", errors="ignore")),
-                    skiprows=2,
-                    on_bad_lines="skip",
-                )
+                raw = z.read(name).decode("utf-8", errors="ignore").splitlines()
+                hdr = 0
+                for j, ln in enumerate(raw):
+                    if ln.lower().startswith("date"):
+                        hdr = j
+                        break
+                meta = list(csv.reader([raw[hdr - 1]]))[0] if hdr else []
+                country = iso3(meta[4]) if len(meta) > 4 else code
+                df = pd.read_csv(io.StringIO("\n".join(raw[hdr:])), on_bad_lines="skip")
                 df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
                 df = df.dropna(subset=["Date"]).set_index("Date")
-                direct[code] = pd.to_numeric(df[df.columns[1]], errors="coerce")
+                direct[country] = pd.to_numeric(df[df.columns[1]], errors="coerce")
     spreads = {}
     for c in ten:
         if c in three:
@@ -250,7 +316,7 @@ def main(zip_path="mainz.zip"):
     zip_path = Path(zip_path)
     if not zip_path.exists():
         raise FileNotFoundError(zip_path)
-    real = load_price_series(zip_path, real=True)
+    real, meta = load_price_series(zip_path, real=True, return_meta=True)
     nominal = load_price_series(zip_path, real=False)
     spreads = load_yield_spread(zip_path)
     if real.empty:
@@ -264,7 +330,7 @@ def main(zip_path="mainz.zip"):
         vol = realized_vol(ret)
         phase = cycle_phase(vol)
         if not spreads.empty:
-            country = ticker[:3]
+            country = meta.get(ticker)
             if country in spreads.columns:
                 sp = spreads[country].reindex(ret.index, method="ffill")
                 model, auc_val = logistic_transition(sp, phase, states)
