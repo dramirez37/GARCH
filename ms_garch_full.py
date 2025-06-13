@@ -48,9 +48,15 @@ def load_price_series(zip_path: str, real=True):
 
 
 def load_yield_spread(zip_path: str):
-    """Return DataFrame of 10y minus 3m yields for each country."""
+    """Return DataFrame of 10y minus 3m yields for each country.
+
+    Some archives include a direct 10Y-3M spread series (e.g. ``T10Y3M``) for
+    the United States rather than separate 10y and 3m yields.  Those are loaded
+    verbatim and merged with the computed spreads for other countries.
+    """
     ten = {}
     three = {}
+    direct = {}
     with zipfile.ZipFile(zip_path) as z:
         for name in z.namelist():
             if not name.lower().endswith(".csv"):
@@ -78,14 +84,24 @@ def load_yield_spread(zip_path: str):
                 df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
                 df = df.dropna(subset=["Date"]).set_index("Date")
                 three[country] = pd.to_numeric(df[df.columns[1]], errors="coerce")
-    spreads = []
+            if "10Y3M" in code.upper():
+                df = pd.read_csv(
+                    io.StringIO(z.read(name).decode("utf-8", errors="ignore")),
+                    skiprows=2,
+                    on_bad_lines="skip",
+                )
+                df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+                df = df.dropna(subset=["Date"]).set_index("Date")
+                direct[code] = pd.to_numeric(df[df.columns[1]], errors="coerce")
+    spreads = {}
     for c in ten:
         if c in three:
-            df = pd.DataFrame({"10y": ten[c], "3m": three[c]})
-            spreads.append((c, df["10y"] - df["3m"]))
+            spreads[c] = ten[c] - three[c]
+    for c, series in direct.items():
+        spreads[c] = series
     if not spreads:
         return pd.DataFrame()
-    return pd.concat({c: s for c, s in spreads}, axis=1)
+    return pd.concat(spreads, axis=1)
 
 
 def ms_garch_neglog(params, r):
