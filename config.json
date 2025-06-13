@@ -1,0 +1,6 @@
+{
+  "tickers": ["BRT_D", "CMALSD"],
+  "realms": {"commodities": ["BRT_D"], "indices": ["CMALSD"]},
+  "era_start": "2000-01-01",
+  "hyperparameters": {"arima_order": [1,0,0], "garch_pq": [1,1]}
+}
